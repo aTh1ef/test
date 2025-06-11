@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 import asyncio
 import aiohttp
 from enum import Enum
+import yt_dlp
+import tempfile
 
 # Import LangGraph dependencies
 from langgraph.graph import StateGraph, END, START
@@ -409,24 +411,70 @@ def get_video_title(video_id):
         logger.warning(f"Could not get video title: {str(e)}")
         return f"YouTube Video {video_id}"
 
-def get_youtube_transcript(video_id):
+def get_transcript_with_ytdlp(video_id):
+    """Fallback method to get transcript using yt-dlp"""
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
-        if not transcript_list:
-            st.error("No transcript content available for this video.")
-            return None
-        full_transcript = " ".join([part["text"] + " " for part in transcript_list])
-        if not full_transcript.strip():
-            st.error("Transcript is empty after processing.")
-            return None
-        return full_transcript
-    except TranscriptsDisabled:
-        st.error("Transcripts are disabled for this video.")
-        return None
-    except Exception as e:
-        st.error(f"No transcript available for this video: {str(e)}")
-        return None
+        ydl_opts = {
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitlesformat': 'vtt',
+            'skip_download': True,
+            'quiet': True
+        }
         
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            url = f'https://www.youtube.com/watch?v={video_id}'
+            info = ydl.extract_info(url, download=False)
+            
+            # Try to get manual subtitles first
+            if info.get('subtitles') and info['subtitles'].get('en'):
+                subtitle_url = info['subtitles']['en'][0]['url']
+            # Fallback to automatic captions
+            elif info.get('automatic_captions') and info['automatic_captions'].get('en'):
+                subtitle_url = info['automatic_captions']['en'][0]['url']
+            else:
+                return None
+                
+            # Download the subtitle file
+            response = requests.get(subtitle_url)
+            if response.status_code == 200:
+                # Parse VTT content
+                vtt_content = response.text
+                # Simple VTT parsing - combine all text lines
+                transcript_text = ""
+                for line in vtt_content.split('\n'):
+                    # Skip timecodes, positioning and VTT header
+                    if '-->' in line or line.startswith('WEBVTT') or line.strip() == '':
+                        continue
+                    transcript_text += line.strip() + " "
+                return transcript_text.strip()
+    except Exception as e:
+        logger.error(f"yt-dlp fallback failed: {str(e)}")
+        return None
+
+def get_youtube_transcript(video_id):
+    """Get transcript with fallback methods"""
+    try:
+        # First try: YouTube Transcript API
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        if transcript_list:
+            full_transcript = " ".join([part["text"] + " " for part in transcript_list])
+            if full_transcript.strip():
+                return full_transcript
+    except Exception as e:
+        logger.warning(f"Primary transcript method failed: {str(e)}")
+    
+    # Second try: yt-dlp fallback
+    logger.info("Attempting yt-dlp fallback method...")
+    transcript = get_transcript_with_ytdlp(video_id)
+    if transcript:
+        return transcript
+    
+    # If all methods fail
+    logger.error(f"All transcript fetching methods failed for video {video_id}")
+    st.error("Failed to fetch transcript. Please try another video with available captions.")
+    return None
+
 def polish_transcript_with_gemini(raw_transcript: str, video_title: str) -> str:
     """
     Polish raw YouTube transcript using Gemini to make it context-aware and AI-friendly.
